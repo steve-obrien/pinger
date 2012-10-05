@@ -5,38 +5,35 @@ var request = require('request');
 var $ = require('jquery');
 var mysql = require('mysql');
 var _ = require('underscore');
+var postmark = require('postmark')('15fa02db-fa13-47cc-853b-e4489f4fb18b');
+require('date-utils');
 
 var dbConfig = {
   host     : 'localhost',
   user     : 'root',
-  password : '',
+  password : ''
 }
 
-function executeFunctionByName(functionName, context) {
-	var args = Array.prototype.slice.call(arguments).splice(2);
-	var namespaces = functionName.split(".");
-	var func = namespaces.pop();
-	for(var i = 0; i < namespaces.length; i++) {
-		context = context[namespaces[i]];
+var dbTable = 'newiconadmin_development.pinger_script';
+
+var testFunctions = {
+	shouldSee : function(text, error, reponse, body){
+		console.log('should see: ' + text);
+		return $('body:contains("'+text+'")', body).length;
 	}
-	return context[func].apply(this, args);
-}
+};
+
 
 // when something goes wrong we need to notify peeps
 var notify = function(){
-
+	// TODO: send an email or something.
+	
 }
 
-var shoudSee = function(text, error, reponse, body){
-	return $('body:contains("'+text+'")', body).length;
-}
-
-var runtest = function(row, txt) {
-	txt = txt || '';
-
+var parseScript = function(script){
 	doScript = [];
 	// parse script
-    var lines = row.script.match(/^.*((\r\n|\n|\r)|$)/gm);
+    var lines = script.match(/^.*((\r\n|\n|\r)|$)/gm);
 	for (l=0; l<=lines.length; l++) {
 
 	    var line = lines[l];
@@ -48,56 +45,86 @@ var runtest = function(row, txt) {
 	    	// found goto line
 	    	// look for following test commands
 
-	    	goto = m[2].replace(/\s/g, "X");
-	    	var cmd = {goto:m[2].replace(/\s/g, "X"), tests:[]};
-	    	doScript.push(cmd);
+	    	var scriptAction = {
+				cmd:{
+					fun:'goto', 
+					args:{
+						uri:url.parse(m[2].replace(/\s/g, "X")), 
+						port:80,
+						followRedirect:true,
+						path:'/'
+					}
+				},
+				tests:[]
+			};
+	    	doScript.push(scriptAction);
 	    	continue;                
 	    }}
 	    
 	    // search for sub goto commands
 	    var m = lines[l].match(/(i should see) (.*)/)
 	    if(m != null) {if(m.length > 2 && m[1] == 'i should see'){
-            cmd.tests.push({fun:'shouldSee', args:m[2]});
+            scriptAction.tests.push({fun:'shouldSee', args:m[2]});
 	    }}
+	
 	}
+	return doScript;
+}
 
 
-	_.each(doScript, function(command){
 
-		var options = {
-		  uri: url.parse(command.goto),
-		  path: '/',
-		  port: '80',
-		  followRedirect:true
-		};
-		var request = require('request');
-		request(options, function (error, response, body) {
-			var tests = false;
-			_.each(command.tests, function(test){
-				tests = executeFunctionByName(test.fun, this, test.args, error, response, body);
-			});
-			if(tests)
-				console.log('tests passed!');
-			else
-				console.log('tests failed!');
+var runtest = function(row, txt) {
+	txt = txt || '';
+	
+	var doScript = parseScript(row.script)
 
-			if (!error && response.statusCode == 200) {
-				// var textFound = $('body:contains("'+shouldSee+'")', body);
-				// if(textFound.length)
-				// 	console.log(txt + ' FOUND TEXT ' + shouldSee);
-				// else
-				// 	console.log('ERROR: Did not find text Newicon')
-				console.log('passed')
-			} else {
-				console.log('ERROR: status code not 200')
-			}
-		})
-		
+	_.each(doScript, function(scriptAction){
+
+		if(scriptAction.cmd.fun == 'goto'){
 			
+			console.log('goto: ' + JSON.stringify(scriptAction.cmd.args.uri.host));
+			var request = require('request');
+			request(scriptAction.cmd.args, function (error, response, body) {
+			
+				var testsResult = false;
+				
+				if (!error && response.statusCode == 200)
+					testsResult = true;
+
+				_.each(scriptAction.tests, function(test){
+					if (!testsResult) return;
+					testsResult = testFunctions[test.fun].call(this, test.args, error, response, body);
+				});
+				
+				
+				
+				if (!testsResult) {
+					postmark.send({
+						"From": "theteam@newicon.net", 
+						"To": "steve@newicon.net", 
+						"Subject": "Pinger Test Failed: " + row.name,
+						"TextBody": "The following pinger script failed: \n\n " + row.name + ':\n'+row.script,
+						"HtmlBody":"The following pinger script failed: <br /><br /> " + row.name + ':<br />'+row.script
+					});
+					
+				}
+				
+				// should be able to use a previous db connection but this script stays running... so should I never bother
+				// closing the connection ??
+				var db = mysql.createConnection(dbConfig);db.connect();
+				db.query('UPDATE '+dbTable+' SET ? WHERE id = ' + row.id,{
+					last_test_passed	: testsResult ? 1 : 0, 
+					last_tested			: new Date().toFormat('YYYY-DD-MM HH24:MI:SS')}, 
+					function(err, result) {
+						if (err) throw err;
+					}
+				);
+				db.end();
+				console.log(testsResult ? 'PASSED' : 'FAILED');
+			})
+		}
+		
 	});
-
-	console.log(doScript)
-
 }
 
 var ticker = 0;
@@ -106,20 +133,19 @@ var tick = function(){
 	// create a new db connection for each tick.
 	var connection = mysql.createConnection(dbConfig);
 	connection.connect();
-	
 
-	connection.query('SELECT * from newiconadmin_development.pinger_script', function(err, rows, fields) {
+	connection.query('SELECT * from '+dbTable, function(err, rows, fields) {
 		if (err) throw err;
 		_.each(rows, function(row){
-			runtest(row, ticker)
+			if(row.enabled)
+				runtest(row, ticker)
 		})
 	});
 
 	ticker += 1;
-	
 
 	connection.end();
 }
 
 tick();
-setInterval(tick, 2000)
+setInterval(tick, 60000)
