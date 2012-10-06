@@ -1,11 +1,13 @@
-var express = require('express');
-var app = express();
-var url = require('url');
-var request = require('request');
-var $ = require('jquery');
-var mysql = require('mysql');
-var _ = require('underscore');
-var postmark = require('postmark')('15fa02db-fa13-47cc-853b-e4489f4fb18b');
+//var express = require('express'),
+//	app = express()
+var url = require('url'),
+	request = require('request'),
+	mysql = require('mysql'),
+	postmark = require('postmark')('15fa02db-fa13-47cc-853b-e4489f4fb18b'),
+	util = require('util');
+	$ = require('jquery'),
+	_ = require('underscore'),
+
 require('date-utils');
 
 var dbConfig = {
@@ -16,20 +18,28 @@ var dbConfig = {
 
 var dbTable = 'newiconadmin_development.pinger_script';
 
-var testFunctions = {
-	shouldSee : function(text, error, reponse, body){
-		console.log('should see: ' + text);
-		return $('body:contains("'+text+'")', body).length;
-	}
-};
-
-
 // when something goes wrong we need to notify peeps
-var notify = function(){
-	// TODO: send an email or something.
-	
+var notify = function(row){
+	postmark.send({
+		"From": "theteam@newicon.net", 
+		"To": "steve@newicon.net", 
+		"Subject": "Pinger Test Failed: " + row.name,
+		"TextBody": "The following pinger script failed: \n\n " + row.name + ':\n'+row.script+'\n\nLog:\n'+row.last_log,
+		"HtmlBody":"The following pinger script failed: <br /><br /> " + row.name + ':<br />'+row.script.replace(/\n/g, '<br />')+'<br/><br/>Log:<br/>'+row.last_log.replace(/\n/g, '<br />')
+	});
 }
 
+// parse the script "do" test script into a json array
+// format:
+// [
+//   {
+//	   cmd: {fun:'goto','args'{}},
+//	   tests:[
+//	     {fun:'testFunctionName', args:'test arguments'},
+//       {fun:'testFunctionName', args:'test arguments'}
+//     ]
+//	 }, ...
+// ] 
 var parseScript = function(script){
 	doScript = [];
 	// parse script
@@ -71,59 +81,64 @@ var parseScript = function(script){
 	return doScript;
 }
 
+// define test functions
+var testFunctions = {
+	shouldSee : function(text, error, reponse, body){
+		var res = $('body:contains("'+text+'")', body).length;
+		return {
+			log: 'should see: "' + text + '" - ' + (res ? 'passed' : 'failed'),
+			result: res
+		}
+	}
+};
 
-
+// ran for each row
 var runtest = function(row, txt) {
 	txt = txt || '';
-	
+	// variable to store log messages
+	var log = '';
 	var doScript = parseScript(row.script)
-
+	var testResult = false;
+	
 	_.each(doScript, function(scriptAction){
+		
+		if (scriptAction.cmd.fun == 'goto'){
 
-		if(scriptAction.cmd.fun == 'goto'){
-			
-			console.log('goto: ' + JSON.stringify(scriptAction.cmd.args.uri.host));
-			var request = require('request');
 			request(scriptAction.cmd.args, function (error, response, body) {
-			
-				var testsResult = false;
 				
-				if (!error && response.statusCode == 200)
-					testsResult = true;
-
+				log += 'goto: ' + JSON.stringify(scriptAction.cmd.args.uri.host);
+				
+				testResult = (!error && response.statusCode == 200);
+				log += (testResult ? ' - success' : ' - failed with response code: '+response.statusCode);
+				
 				_.each(scriptAction.tests, function(test){
-					if (!testsResult) return;
-					testsResult = testFunctions[test.fun].call(this, test.args, error, response, body);
+					if (testResult == false) return;
+					var ret = testFunctions[test.fun].call(this, test.args, error, response, body);
+					testResult = ret.result;
+					log += '\n' + ret.log + '';
 				});
 				
-				
-				
-				if (!testsResult) {
-					postmark.send({
-						"From": "theteam@newicon.net", 
-						"To": "steve@newicon.net", 
-						"Subject": "Pinger Test Failed: " + row.name,
-						"TextBody": "The following pinger script failed: \n\n " + row.name + ':\n'+row.script,
-						"HtmlBody":"The following pinger script failed: <br /><br /> " + row.name + ':<br />'+row.script
-					});
-					
-				}
-				
+				log += "\nTest status: " + (testResult ? 'PASSED' : 'FAILED') + '\n';
+	
 				// should be able to use a previous db connection but this script stays running... so should I never bother
 				// closing the connection ??
 				var db = mysql.createConnection(dbConfig);db.connect();
-				db.query('UPDATE '+dbTable+' SET ? WHERE id = ' + row.id,{
-					last_test_passed	: testsResult ? 1 : 0, 
-					last_tested			: new Date().toFormat('YYYY-DD-MM HH24:MI:SS')}, 
-					function(err, result) {
-						if (err) throw err;
-					}
-				);
+				var update = {
+					last_test_passed : testResult ? 1 : 0, 
+					last_tested      : new Date().toFormat('YYYY-MM-DD HH24:MI:SS'),
+					last_log         : log
+				};
+				db.query('UPDATE '+dbTable+' SET ? WHERE id = ' + row.id, update,function(err, result) {
+					if (err) throw err;
+				});
 				db.end();
-				console.log(testsResult ? 'PASSED' : 'FAILED');
+				
+				if (!testResult)
+					notify(_.extend(row, update));
+				
+				console.log(log);
 			})
 		}
-		
 	});
 }
 
@@ -148,4 +163,4 @@ var tick = function(){
 }
 
 tick();
-setInterval(tick, 60000)
+setInterval(tick, 10000)
